@@ -1,11 +1,12 @@
 import asyncio
 import requests
 import json
+import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from agents import Agent, Runner, function_tool
-from ddgs import DDGS
+from tavily import TavilyClient
 
 load_dotenv()
 
@@ -58,12 +59,30 @@ def gather_threat_intel(cve_id: str) -> str:
     Tool: Searches the web for technical details about a CVE.
     """
     print(f" TOOL: Searching context for {cve_id}...")
-    try:
 
-        results = DDGS().text(keywords=f"{cve_id} exploit analysis", max_results=3)
-        if not results:
+
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return "Error: TAVILY_API_KEY not found in .env"
+
+
+
+    try:
+        tavily = TavilyClient()
+        response = tavily.search(
+            query=f"{cve_id} exploit analysis technical details",
+            search_depth="basic",
+            max_results=3
+        )
+
+        # Tavily returns a clean list of dictionaries
+        context = response.get("results", [])
+
+        if not context:
             return "No external context found."
-        return json.dumps(results)
+
+        return json.dumps(context)
+
     except Exception as e:
         return f"Search Error: {e}"
 
@@ -91,7 +110,7 @@ triage_agent = Agent(
 )
 
 #Quick accuracy check
-# 2. Define the Async Main Loop
+
 async def main():
     # 1. Sense
     catalog = pull_cisa_catalog()
@@ -99,20 +118,30 @@ async def main():
 
     print(f"\n[*] Triage Queue: {len(active_threats)} vulnerabilities found.\n")
 
-    # 2. Act
-    for threat in active_threats[:2]:
-        cve_id = threat.get("cveID")
-        print(f"--- Processing {cve_id} ---")
+    # 2. Generate report
+    with open("triage_reports.md", "w", encoding='utf-8') as f:
+        f.write("# Daily Triage Report\n\n")
+        f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d')}\n")
+        f.write(f"**Threats Found:** {len(active_threats)}\n\n")
 
-        # FIX: Correct arguments based on documentation
-        result = await Runner.run(
-            starting_agent=triage_agent,
-            input=f"Triage this threat: {json.dumps(threat)}"
-        )
+        for threat in active_threats[:2]:
+            cve_id = threat.get("cveID")
+            print(f"--- Processing {cve_id} ---")
 
-        print(result.final_output)
-        print("\n" + "=" * 50 + "\n")
+            # Run the Agent
+            result = await Runner.run(
+                starting_agent=triage_agent,
+                input=f"Triage this threat: {json.dumps(threat)}"
+            )
 
+            # Print to console
+            print(result.final_output)
+            print("\n" + "=" * 50 + "\n")
+
+            # Output to file
+            f.write(result.final_output + "\n")
+            f.write("\n---\n")
+    print(f"Report generated: triage_reports.md")
 
 # 3. Execution Entry Point
 if __name__ == "__main__":
