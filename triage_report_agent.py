@@ -16,7 +16,7 @@ load_dotenv()
 CISA_JSON_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 MODEL_ID = "gpt-5-mini"
 STATE_FILE = "processed_cves.json"
-BATCH_SIZE = 3  # Configurable batch size for throttling
+BATCH_SIZE = 1  # Configurable batch size for throttling
 
 
 # --- PERSISTENCE LAYER ---
@@ -99,12 +99,12 @@ def filter_active_threats(kev_list: List[Dict], days_back: int = 30) -> List[Dic
     return sorted(active_threats, key=lambda x: x["dateAdded"], reverse=True)
 
 
-# --- ASYNC ACT LAYER (Tooling) ---
-@function_tool
-async def gather_threat_intel(cve_id: str) -> str:
+# --- ASYNC ACT LAYER ---
+
+# 1. The Logic (Pure Python, easily testable)
+async def fetch_threat_context(cve_id: str) -> str:
     """
-    Tool: Performs a semantic search for technical details using Tavily.
-    Executes in a thread to prevent blocking the async event loop.
+    Performs the actual API work. Segregated for unit testing.
     """
     print(f"[*] TOOL: Searching context for {cve_id}...")
     api_key = os.getenv("TAVILY_API_KEY")
@@ -113,19 +113,25 @@ async def gather_threat_intel(cve_id: str) -> str:
 
     try:
         tavily = TavilyClient(api_key=api_key)
-        # Offload blocking I/O to a thread
+        # Search for "PoC" and "GitHub"
         response = await asyncio.to_thread(
             tavily.search,
-            query=f"{cve_id} exploit analysis technical details",
+            query=f"{cve_id} public exploit poc github technical analysis",
             search_depth="basic",
             max_results=3
         )
         context = response.get("results", [])
         return json.dumps(context) if context else "No external context found."
-
     except Exception as e:
         return f"Search Error: {e}"
 
+# 2. The Tool (The Agent Interface)
+@function_tool
+async def gather_threat_intel(cve_id: str) -> str:
+    """
+    Agent wrapper for the context search logic.
+    """
+    return await fetch_threat_context(cve_id)
 
 # --- DECISION LAYER (Agent Architecture) ---
 
@@ -134,12 +140,21 @@ analyst_agent = Agent(
     name="CISA_Researcher",
     model=MODEL_ID,
     instructions="""
-    You are a Senior Vulnerability Analyst.
-    PROTOCOL:
-    1. Analyze the input CISA data (Ground Truth).
-    2. Call 'gather_threat_intel' to find real-world exploitation context.
-    3. Draft a technical summary including Severity and "In the Wild" status.
-    """,
+        You are a Senior Vulnerability Analyst.
+        PROTOCOL:
+        1. Analyze the input CISA data (Ground Truth).
+        2. Call 'gather_threat_intel' to find real-world exploitation context (PoCs).
+        3. Draft a technical summary.
+
+        - You MUST use the specific Markdown schema below.
+        - You MUST provide concrete Action items (e.g., specific Firewall rules, Splunk queries) if found in the text. Generic advice will be rejected.
+
+        ## [CVE ID] : [Name]
+        **Severity**: [Critical/High/Medium]
+        **Summary**: [Technical description including attack vector]
+        **In the Wild**: [Yes/No - specific details from CISA/Search]
+        **Action**: [Specific mitigation steps or "Apply Vendor Patch"]
+        """,
     tools=[gather_threat_intel]
 )
 
@@ -165,18 +180,17 @@ critic_agent = Agent(
     **Summary**: [Technical description]
     **In the Wild**: [Exploitation status]
     **Action**: [Specific mitigation steps]
-    """
+        """
 )
 
 
 # --- MAIN PIPELINE ---
 async def main():
-    # 1. Sense
     catalog = await pull_cisa_catalog()
     active_threats = filter_active_threats(catalog, days_back=30)
 
     if not active_threats:
-        print("\n[!] No new threats found. System is up to date.")
+        print("\n[!] No new threats found.")
         return
 
     print(f"\n[*] Processing {len(active_threats)} new threats (Batch: {BATCH_SIZE})...")
@@ -184,66 +198,73 @@ async def main():
     with open("triage_reports.md", "a", encoding='utf-8') as f:
         f.write(f"\n# Run: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
 
-        # NOTE: We process serially (instead of asyncio.gather) to maintain
-        # readable console logs for the demo and strictly adhere to API rate limits.
         for threat in active_threats[:BATCH_SIZE]:
             cve_id = threat.get("cveID")
             print(f"--- Processing {cve_id} ---")
 
-            # Step A: Analyst Drafts
-            print("   > Analyst is researching...")
-            current_draft = await Runner.run(
-                starting_agent=analyst_agent,
-                input=f"Research this threat: {json.dumps(threat)}"
-            )
+            try:
 
-            # Step B: The Self-Healing Loop (Content + Schema Validation)
-            final_output = current_draft.final_output
-
-            for attempt in range(2):  # Bounded recursion (Max 2 retries)
-                print(f"   > Quality Check (Attempt {attempt + 1}/2)...")
-
-                # 1. Critic Review (Probabilistic Check)
-                critique = await Runner.run(
-                    starting_agent=critic_agent,
-                    input=f"Review this draft: {current_draft.final_output}"
-                )
-
-                feedback = ""
-
-                if "APPROVED" in critique.final_output:
-                    # Strip the approval tag
-                    potential_final = critique.final_output.replace("APPROVED", "").strip()
-
-                    # 2. Schema Validation (Deterministic Check)
-                    validation_error = validate_report_structure(potential_final)
-
-                    if validation_error:
-                        print(f"   > Content Approved, but Schema Failed: {validation_error}")
-                        feedback = f"Fix the report structure. {validation_error}"
-                    else:
-                        print("   > Draft APPROVED & VALIDATED.")
-                        final_output = potential_final
-                        break  # Success
-                else:
-                    print("   > Critic REJECTED content.")
-                    feedback = critique.final_output
-
-                # 3. Feedback Loop (Analyst Fixes)
+                # 1. Analyst Drafts
+                print("   > Analyst is researching...")
                 current_draft = await Runner.run(
                     starting_agent=analyst_agent,
-                    input=f"Fix the report based on this feedback: {feedback}"
+                    input=f"Research this threat: {json.dumps(threat)}"
                 )
 
-                # Fallback on failure
-                if attempt == 1:
-                    print("   > Max retries reached. Outputting best effort.")
-                    final_output = current_draft.final_output
+                # 2. Self-Healing Loop
+                final_output = current_draft.final_output
+                is_valid = False
 
-            # Output & Persistence
-            print(final_output + "\n" + "=" * 50)
-            f.write(final_output + "\n\n---\n")
-            save_processed_cve(cve_id)
+                for attempt in range(2):
+                    print(f"   > Quality Check (Attempt {attempt + 1}/2)...")
+
+                    critique = await Runner.run(
+                        starting_agent=critic_agent,
+                        input=f"Review this draft: {current_draft.final_output}"
+                    )
+
+                    if "APPROVED" in critique.final_output:
+                        potential_final = critique.final_output.replace("APPROVED", "").strip()
+                        validation_error = validate_report_structure(potential_final)
+
+                        if validation_error:
+                            print(f"   > Content Approved, but Schema Failed: {validation_error}")
+                            # Fix Schema
+                            current_draft = await Runner.run(
+                                starting_agent=analyst_agent,
+                                input=f"Fix the report structure: {validation_error}"
+                            )
+                        else:
+                            print("   > Draft APPROVED & VALIDATED.")
+                            final_output = potential_final
+                            is_valid = True
+                            break
+                    else:
+                        print("   > Critic REJECTED content.")
+                        # Fix Content
+                        current_draft = await Runner.run(
+                            starting_agent=analyst_agent,
+                            input=f"Fix report based on feedback: {critique.final_output}. DO NOT call tools/search again. Just rewrite the text."
+                        )
+
+                        if attempt == 1:
+                            print("   > Max retries reached. Publishing best effort.")
+                            final_output = current_draft.final_output
+
+                if not is_valid:
+                    final_output = f"# [NEEDS REVIEW] {final_output}"
+
+                # Clean Report
+                if "## CVE" in final_output:
+                    final_output = final_output[final_output.find("## CVE"):]
+
+                print(final_output + "\n" + "=" * 50)
+                f.write(final_output + "\n\n---\n")
+                save_processed_cve(cve_id)
+
+            except Exception as e:
+                print(f"[-] ERROR processing {cve_id}: {e}")
+                continue
 
     print("[+] Triage Complete.")
 
